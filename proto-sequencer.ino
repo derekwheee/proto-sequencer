@@ -1,3 +1,6 @@
+// TODO: Smooth tuning pin potentiometer value?
+// TODO: Add comments where it would be helpful
+
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_LEDBackpack.h>
@@ -10,14 +13,14 @@
 #define USING_TIMER_TC3 true
 #define SELECTED_TIMER TIMER_TC3
 
-SAMDTimer ITimer(SELECTED_TIMER);
+SAMDTimer sequenceTimer(SELECTED_TIMER);
 
 // DotStar config
 #define NUM_LEDS 1
-#define DATAPIN 8
-#define CLOCKPIN 6
+#define LED_DATA_PIN 8
+#define LED_CLCK_PIN 6
 
-Adafruit_DotStar strip(NUM_LEDS, DATAPIN, CLOCKPIN, DOTSTAR_BRG);
+Adafruit_DotStar strip(NUM_LEDS, LED_DATA_PIN, LED_CLCK_PIN, DOTSTAR_BRG);
 
 Adafruit_7segment displayMatrix = Adafruit_7segment();
 
@@ -29,6 +32,7 @@ const int BUTTON_2_PIN = 9;
 const int BUTTON_3_PIN = 10;
 const int BUTTON_4_PIN = 11;
 const int BUTTON_5_PIN = 12;
+const int GATE_PIN = 13;
 
 const int BUTTON_PINS[] = {
     BUTTON_1_PIN,
@@ -49,7 +53,7 @@ int buttonLastValues[numButtons] = {LOW, LOW, LOW, LOW, LOW};
 
 const double dacRange[2] = {0, DAC_HIGH};
 const double voltageRange[2] = {0, ANALOG_HIGH};
-const double bpmRange[2] = {60, 600};
+const double bpmRange[2] = {60, 480};
 const double cvRange[2] = {0, 6};
 
 uint32_t potentiometerValue;
@@ -68,6 +72,11 @@ bool showingPixel = false;
 unsigned long lastUpdateTime = 0;
 const unsigned long updateInterval = 100;
 
+int gateState = LOW;
+
+float smoothingFactor = 0.2;
+float smoothedBpmValue = 0;
+
 void setup()
 {
     bpm = scale(120, bpmRange, voltageRange);
@@ -78,8 +87,9 @@ void setup()
     pinMode(BUTTON_3_PIN, INPUT_PULLDOWN);
     pinMode(BUTTON_4_PIN, INPUT_PULLDOWN);
     pinMode(BUTTON_5_PIN, INPUT_PULLDOWN);
+    pinMode(GATE_PIN, OUTPUT);
 
-    ITimer.attachInterruptInterval_MS(60 * 1000 / scale(bpm, voltageRange, bpmRange) / 4, playSequence);
+    sequenceTimer.attachInterruptInterval_MS(60 * 1000 / scale(bpm, voltageRange, bpmRange) / 4, playSequence);
 
     strip.begin();
     strip.show();
@@ -105,9 +115,11 @@ void loop()
         potentiometerValue = analogRead(POTENTIOMETER_PIN);
         bpmPotentiometerValue = analogRead(BPM_POTENTIOMETER_PIN);
 
-        if (lastBpmPotentiometerValue != bpmPotentiometerValue)
+        smoothedBpmValue = (smoothingFactor * bpmPotentiometerValue) + ((1 - smoothingFactor) * smoothedBpmValue);
+
+        if (lastBpmPotentiometerValue != smoothedBpmValue)
         {
-            handleBpmPotentiometerChange(bpmPotentiometerValue);
+            handleBpmPotentiometerChange(smoothedBpmValue);
         }
 
         if (getHeldButton(now) > -1)
@@ -118,15 +130,6 @@ void loop()
         if (wasAnyButtonPressed(now))
         {
             handleButtonChange(now);
-        }
-
-        // Serial.println(scale(bpm, voltageRange, bpmRange));
-        // Serial.println(currentBeat);
-
-        for (int i = 0; i < numButtons; ++i)
-        {
-            Serial.println(buttonStates[i]);
-            Serial.println(sequences[i]);
         }
     }
 }
@@ -162,6 +165,10 @@ void playSequence()
         if (currentBeat == i + 1 && buttonStates[i] == true)
         {
             analogWrite(DAC_OUTPUT_PIN, scale(sequences[i], voltageRange, dacRange));
+            digitalWrite(GATE_PIN, HIGH);
+            // TODO: It's not great to use a blocking delay here
+            delay(1000 / scale(bpm, voltageRange, bpmRange) / 2);
+            digitalWrite(GATE_PIN, LOW);
             break;
         }
     }
@@ -286,8 +293,8 @@ void handleBpmPotentiometerChange(float nextValue)
         bpm = nextValue;
     }
 
-    ITimer.detachInterrupt();
-    ITimer.attachInterruptInterval_MS(60 * 1000 / scale(bpm, voltageRange, bpmRange) / 4, playSequence);
+    sequenceTimer.detachInterrupt();
+    sequenceTimer.attachInterruptInterval_MS(60 * 1000 / scale(bpm, voltageRange, bpmRange) / 4, playSequence);
 
     lastBpmChange = now;
 }
