@@ -73,7 +73,7 @@ void initializeButtons()
     for (int i = 0; i < sizeof(buttons) / sizeof(buttons[0]); i++)
     {
         buttons[i].pin = BUTTON_PINS[i];
-        buttons[i].cv = 0.0;
+        buttons[i].cv = i % 6;
         buttons[i].state = true;
         buttons[i].beginHighState = 0;
         buttons[i].value = LOW;
@@ -81,6 +81,14 @@ void initializeButtons()
         pinMode(buttons[i].pin, INPUT_PULLUP);
     }
 }
+
+struct DisplayChar
+{
+    char note;
+    bool isSharp;
+};
+
+DisplayChar getChar(int index);
 
 // Constants
 const int ANALOG_HIGH = 1023;
@@ -148,8 +156,8 @@ void loop()
         lastBpmPotentiometerValue = potentiometerValue;
 
         potentiometerValue = clamp(analogRead(POTENTIOMETER_PIN), voltageRange);
-        bpmPotentiometerValue = clamp(analogRead(BPM_POTENTIOMETER_PIN), voltageRange);     
-        gatePotentiometerValue = (int) scale(analogRead(GATE_POTENTIOMETER_PIN), voltageRange, gateRange, 1);
+        bpmPotentiometerValue = clamp(analogRead(BPM_POTENTIOMETER_PIN), voltageRange);
+        gatePotentiometerValue = (int)scale(analogRead(GATE_POTENTIOMETER_PIN), voltageRange, gateRange, 1);
 
         smoothedBpmValue = (smoothingFactor * bpmPotentiometerValue) + ((1 - smoothingFactor) * smoothedBpmValue);
         smoothedGateValue = (smoothingFactor * gatePotentiometerValue) + ((1 - smoothingFactor) * smoothedGateValue);
@@ -298,26 +306,35 @@ void handleButtonChange(long now)
 {
     for (int i = 0; i < buttonCount; ++i)
     {
+        // The odd button (i.e. 5 or 9) has an additional
+        // double-click interaction so handle it separately
         if (i == buttonCount - 1)
         {
-            if (now - buttons[buttonCount - 1].lastPress > 500)
+            // If it has been more than 500ms since the button was
+            // last pressed treat as single click, toggle state
+            if (now - buttons[i].lastPress > 500)
             {
-                buttons[buttonCount - 1].state = !buttons[buttonCount - 1].state;
+                buttons[i].state = !buttons[i].state;
             }
+            // If it has been less than 500ms treat as a
+            // double-click and remove this button from the sequence
             else
             {
-                buttons[buttonCount - 1].state = numSequences == buttonCount ? false : true;
+                buttons[i].state = numSequences == buttonCount ? false : true;
                 numSequences = numSequences == buttonCount ? buttonCount - 1 : buttonCount;
             }
 
-            buttons[buttonCount - 1].lastPress = now;
+            // Track press timing for single-/double-click handling
+            buttons[i].lastPress = now;
             break;
         }
         else
         {
+            // If the button has changed from HIGH to LOW toggle state
             if (buttons[i].lastValue == HIGH)
             {
                 buttons[i].state = !buttons[i].state;
+                buttons[i].lastPress = now;
                 break; // Exit loop after setting the sequence value
             }
         }
@@ -354,48 +371,68 @@ void handleBpmPotentiometerChange(float nextValue)
     lastBpmChange = now;
 }
 
+DisplayChar getChar(int index)
+{
+    NoteMap noteMap = getNoteFromVoltage(scale(buttons[index].cv, voltageRange, cvRange));
+
+    // If this display character is not the currently playing beat write `_`
+    // If this display character is the current beat but is inactive write `-`
+    // If this display character is the current beat and is active write `${note}`
+    DisplayChar displayChar = {
+        note : index + 1 != currentBeat ? '_' : buttons[index].state ? noteMap.note
+                                                                     : '-',
+        isSharp : noteMap.isSharp
+    };
+
+    return displayChar;
+};
+
 void updateDisplay()
 {
-    // TODO: Update this to handle up to 9 beats
     long now = millis();
     int heldButtonIndex = getHeldButton(now);
 
-    for (int i = 0; i < 5; ++i)
+    int offset = currentBeat > 3 ? 4 : 0;
+
+    DisplayChar char1;
+    DisplayChar char2;
+    DisplayChar char3;
+    DisplayChar char4;
+
+    // If a button is being held down show that note
+    // on all positions
+    if (heldButtonIndex > -1)
     {
-        if (i == 2)
-        {
-            displayMatrix.drawColon(showingPixel);
-        }
-        else
-        {
-            int sequenceIndex = i > 2 ? i - 1 : i;
-
-            NoteMap noteMap = getNoteFromVoltage(scale(buttons[sequenceIndex].cv, voltageRange, cvRange));
-            char displayChar = sequenceIndex + 1 != currentBeat ? '_' : noteMap.note;
-            bool isSharp = noteMap.isSharp;
-
-            if (currentBeat == sequenceIndex + 1 && buttons[sequenceIndex].state == false)
-            {
-                displayChar = '-';
-            }
-
-            if (currentBeat == 5)
-            {
-                NoteMap noteMap5 = getNoteFromVoltage(scale(buttons[4].cv, voltageRange, cvRange));
-                displayChar = noteMap5.note;
-                isSharp = noteMap5.isSharp;
-            }
-
-            if (heldButtonIndex > -1)
-            {
-                NoteMap noteMapHeld = getNoteFromVoltage(scale(buttons[heldButtonIndex].cv, voltageRange, cvRange));
-                displayChar = noteMapHeld.note;
-                isSharp = noteMapHeld.isSharp;
-            }
-
-            displayMatrix.writeDigitAscii(i, displayChar, isSharp);
-        }
+        char1 = getChar(heldButtonIndex);
+        char2 = getChar(heldButtonIndex);
+        char3 = getChar(heldButtonIndex);
+        char4 = getChar(heldButtonIndex);
     }
+    // If the current beat is the last button, i.e.
+    // 5 or 9 show that note on all positions
+    else if (currentBeat == buttonCount)
+    {
+        char1 = getChar(currentBeat - 1);
+        char2 = getChar(currentBeat - 1);
+        char3 = getChar(currentBeat - 1);
+        char4 = getChar(currentBeat - 1);
+    }
+    // Otherwise just show each note for the
+    // current page of beats
+    else
+    {
+        char1 = getChar(0 + offset);
+        char2 = getChar(1 + offset);
+        char3 = getChar(2 + offset);
+        char4 = getChar(3 + offset);
+    }
+
+    displayMatrix.writeDigitAscii(0, char1.note, char1.isSharp);
+    displayMatrix.writeDigitAscii(1, char2.note, char2.isSharp);
+    // Index 2 is the colon position
+    displayMatrix.drawColon(showingPixel);
+    displayMatrix.writeDigitAscii(3, char3.note, char3.isSharp);
+    displayMatrix.writeDigitAscii(4, char4.note, char4.isSharp);
 
     displayMatrix.writeDisplay();
 }
