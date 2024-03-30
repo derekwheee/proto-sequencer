@@ -9,6 +9,9 @@
 #include <Adafruit_DotStar.h>
 #include "NoteTable.h"
 
+// Gate resolution should ideally be divisible by 4
+#define GATE_RESOLUTION 12
+
 // Timer config
 #define USING_TIMER_TC3 true
 #define SELECTED_TIMER TIMER_TC3
@@ -24,48 +27,80 @@ Adafruit_DotStar strip(NUM_LEDS, LED_DATA_PIN, LED_CLCK_PIN, DOTSTAR_BRG);
 
 Adafruit_7segment displayMatrix = Adafruit_7segment();
 
-const int DAC_OUTPUT_PIN = A0;
-const int POTENTIOMETER_PIN = A5;
-const int BPM_POTENTIOMETER_PIN = A4;
-const int BUTTON_1_PIN = 7;
-const int BUTTON_2_PIN = 9;
-const int BUTTON_3_PIN = 10;
-const int BUTTON_4_PIN = 11;
-const int BUTTON_5_PIN = 12;
-const int GATE_PIN = 13;
+#define DAC_OUTPUT_PIN A0
+#define POTENTIOMETER_PIN A5
+#define BPM_POTENTIOMETER_PIN A4
+#define GATE_POTENTIOMETER_PIN A3
+#define BUTTON_1_PIN 7
+#define BUTTON_2_PIN 9
+#define BUTTON_3_PIN 10
+#define BUTTON_4_PIN 11
+#define BUTTON_5_PIN 12
+#define BUTTON_6_PIN 12
+#define BUTTON_7_PIN 12
+#define BUTTON_8_PIN 12
+#define BUTTON_9_PIN 12
+#define GATE_PIN 2
 
 const int BUTTON_PINS[] = {
     BUTTON_1_PIN,
     BUTTON_2_PIN,
     BUTTON_3_PIN,
     BUTTON_4_PIN,
-    BUTTON_5_PIN};
+    BUTTON_5_PIN,
+    BUTTON_6_PIN,
+    BUTTON_7_PIN,
+    BUTTON_8_PIN,
+    BUTTON_9_PIN};
 
-const int numButtons = 5;
-bool buttonStates[numButtons] = {true, true, true, true, true};
-long buttonBeginHighStates[numButtons] = {0, 0, 0, 0, 0};
-int buttonValues[numButtons] = {LOW, LOW, LOW, LOW, LOW};
-int buttonLastValues[numButtons] = {LOW, LOW, LOW, LOW, LOW};
+struct Button
+{
+    int pin;
+    uint32_t cv;
+    bool state;
+    long beginHighState;
+    int value;
+    int lastValue;
+    long lastPress;
+};
+
+Button buttons[sizeof(BUTTON_PINS) / sizeof(BUTTON_PINS[0])];
+
+int buttonCount = sizeof(buttons) / sizeof(buttons[0]);
+
+void initializeButtons()
+{
+    for (int i = 0; i < sizeof(buttons) / sizeof(buttons[0]); i++)
+    {
+        buttons[i].pin = BUTTON_PINS[i];
+        buttons[i].cv = 0.0;
+        buttons[i].state = true;
+        buttons[i].beginHighState = 0;
+        buttons[i].value = LOW;
+        buttons[i].lastValue = LOW;
+        pinMode(buttons[i].pin, INPUT_PULLUP);
+    }
+}
 
 // Constants
-#define ANALOG_HIGH 1023.0
-#define DAC_HIGH 4095.0
+const int ANALOG_HIGH = 1023;
+const int DAC_HIGH = 4095;
 
 const double dacRange[2] = {0, DAC_HIGH};
 const double voltageRange[2] = {0, ANALOG_HIGH};
-const double bpmRange[2] = {60, 480};
-const double cvRange[2] = {0, 6};
+const double bpmRange[2] = {1, 4096};
+const double cvRange[2] = {0, 5};
+const double gateRange[2] = {0, 12};
 
 uint32_t potentiometerValue;
 uint32_t lastPotentiometerValue;
 uint32_t bpmPotentiometerValue;
 uint32_t lastBpmPotentiometerValue;
-long button5LastPress;
+uint32_t gatePotentiometerValue;
 
 int bpm;
 int currentBeat = 1;
-int numSequences = 5;
-uint32_t sequences[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+int numSequences = buttonCount;
 
 bool showingPixel = false;
 
@@ -76,27 +111,27 @@ int gateState = LOW;
 
 float smoothingFactor = 0.2;
 float smoothedBpmValue = 0;
+int smoothedGateValue = 0;
+
+int sequenceCounter = -1; // Initial state
 
 void setup()
 {
+    initializeButtons();
+    pinMode(GATE_PIN, OUTPUT);
+
     bpm = scale(120, bpmRange, voltageRange);
     fillNoteMap();
 
-    pinMode(BUTTON_1_PIN, INPUT_PULLDOWN);
-    pinMode(BUTTON_2_PIN, INPUT_PULLDOWN);
-    pinMode(BUTTON_3_PIN, INPUT_PULLDOWN);
-    pinMode(BUTTON_4_PIN, INPUT_PULLDOWN);
-    pinMode(BUTTON_5_PIN, INPUT_PULLDOWN);
-    pinMode(GATE_PIN, OUTPUT);
-
-    sequenceTimer.attachInterruptInterval_MS(60 * 1000 / scale(bpm, voltageRange, bpmRange) / 4, playSequence);
+    // This is the slowest we can run this timer
+    sequenceTimer.attachInterruptInterval_MS(1000 / (scale(bpm, voltageRange, bpmRange) / 60) / GATE_RESOLUTION, playSequence);
 
     strip.begin();
     strip.show();
 
     displayMatrix.begin(0x70);
 
-    Serial.begin(9600);
+    Serial.begin(115200);
 }
 
 void loop()
@@ -112,10 +147,12 @@ void loop()
         lastPotentiometerValue = potentiometerValue;
         lastBpmPotentiometerValue = potentiometerValue;
 
-        potentiometerValue = analogRead(POTENTIOMETER_PIN);
-        bpmPotentiometerValue = analogRead(BPM_POTENTIOMETER_PIN);
+        potentiometerValue = clamp(analogRead(POTENTIOMETER_PIN), voltageRange);
+        bpmPotentiometerValue = clamp(analogRead(BPM_POTENTIOMETER_PIN), voltageRange);     
+        gatePotentiometerValue = (int) scale(analogRead(GATE_POTENTIOMETER_PIN), voltageRange, gateRange, 1);
 
         smoothedBpmValue = (smoothingFactor * bpmPotentiometerValue) + ((1 - smoothingFactor) * smoothedBpmValue);
+        smoothedGateValue = (smoothingFactor * gatePotentiometerValue) + ((1 - smoothingFactor) * smoothedGateValue);
 
         if (lastBpmPotentiometerValue != smoothedBpmValue)
         {
@@ -131,6 +168,10 @@ void loop()
         {
             handleButtonChange(now);
         }
+
+        Serial.println(bpm);
+        Serial.println(scale(bpm, voltageRange, bpmRange));
+        Serial.println(1000 / (scale(bpm, voltageRange, bpmRange) / 60) / GATE_RESOLUTION);
     }
 }
 
@@ -139,39 +180,53 @@ float scale(float value, const double inputRange[2], const double outputRange[2]
     return (value - inputRange[0]) * (outputRange[1] - outputRange[0]) / (inputRange[1] - inputRange[0]) + outputRange[0];
 }
 
+float scale(float value, const double inputRange[2], const double outputRange[2], int precision)
+{
+    float scaled = (value - inputRange[0]) * (outputRange[1] - outputRange[0]) / (inputRange[1] - inputRange[0]) + outputRange[0];
+    return round(scaled * precision) / precision;
+}
+
+float clamp(float value, const double range[2])
+{
+    return value < range[0] ? range[0] : value > range[1] ? range[1]
+                                                          : value;
+}
+
 bool shouldSkipSequence = false;
+
+void incrementSequence()
+{
+    sequenceCounter = sequenceCounter >= GATE_RESOLUTION - 1 ? 0 : 1 + sequenceCounter;
+}
 
 void playSequence()
 {
-    if (!shouldSkipSequence)
+    incrementSequence();
+
+    if (sequenceCounter >= GATE_RESOLUTION - abs(GATE_RESOLUTION - smoothedGateValue))
     {
-        shouldSkipSequence = true;
+        digitalWrite(GATE_PIN, LOW);
     }
-    else
+
+    if (sequenceCounter % GATE_RESOLUTION != 0)
     {
-        shouldSkipSequence = false;
         return;
     }
+
+    unsigned long now = millis();
+
+    showingPixel = !showingPixel;
+
+    int heldButton = getHeldButton(now);
+    int beatIndex = heldButton > -1 ? heldButton : currentBeat - 1;
+
+    analogWrite(DAC_OUTPUT_PIN, scale(buttons[beatIndex].cv, voltageRange, dacRange));
+    digitalWrite(GATE_PIN, HIGH);
 
     updateDisplay();
 
     strip.setPixelColor(0, strip.Color(0, 0, !showingPixel ? 64 : 0));
     strip.show();
-
-    showingPixel = !showingPixel;
-
-    for (int i = 0; i < numButtons; ++i)
-    {
-        if (currentBeat == i + 1 && buttonStates[i] == true)
-        {
-            analogWrite(DAC_OUTPUT_PIN, scale(sequences[i], voltageRange, dacRange));
-            digitalWrite(GATE_PIN, HIGH);
-            // TODO: It's not great to use a blocking delay here
-            delay(1000 / scale(bpm, voltageRange, bpmRange) / 2);
-            digitalWrite(GATE_PIN, LOW);
-            break;
-        }
-    }
 
     if (currentBeat >= numSequences)
     {
@@ -187,9 +242,9 @@ int getHeldButton(long now)
 {
     int _heldButtonIndex = -1;
 
-    for (int i = 0; i < numButtons; ++i)
+    for (int i = 0; i < buttonCount; ++i)
     {
-        if (buttonValues[i] == HIGH && now - buttonBeginHighStates[i] > 500)
+        if (buttons[i].value == HIGH && now - buttons[i].beginHighState > 500)
         {
             _heldButtonIndex = i;
             break;
@@ -203,9 +258,9 @@ bool wasAnyButtonPressed(long now)
 {
     bool _wasAnyButtonPressed = false;
 
-    for (int i = 0; i < numButtons; ++i)
+    for (int i = 0; i < buttonCount; ++i)
     {
-        if (buttonValues[i] == LOW && buttonLastValues[i] == HIGH && now - buttonBeginHighStates[i] < 500)
+        if (buttons[i].value == LOW && buttons[i].lastValue == HIGH && now - buttons[i].beginHighState < 500)
         {
             _wasAnyButtonPressed = true;
             break;
@@ -217,23 +272,23 @@ bool wasAnyButtonPressed(long now)
 
 void updateButtonState(long now)
 {
-    for (int i = 0; i < numButtons; ++i)
+    for (int i = 0; i < buttonCount; ++i)
     {
-        buttonLastValues[i] = buttonValues[i];
-        buttonValues[i] = digitalRead(BUTTON_PINS[i]);
+        buttons[i].lastValue = buttons[i].value;
+        buttons[i].value = digitalRead(BUTTON_PINS[i]);
 
-        if (buttonValues[i] == HIGH && buttonLastValues[i] == LOW)
-            buttonBeginHighStates[i] = now;
+        if (buttons[i].value == HIGH && buttons[i].lastValue == LOW)
+            buttons[i].beginHighState = now;
     }
 }
 
 void handlePotentiometerChange(float nextValue)
 {
-    for (int i = 0; i < numButtons; ++i)
+    for (int i = 0; i < buttonCount; ++i)
     {
-        if (digitalRead(BUTTON_PINS[i]) == HIGH)
+        if (digitalRead(buttons[i].pin) == HIGH)
         {
-            sequences[i] = nextValue;
+            buttons[i].cv = nextValue;
             break; // Exit loop after setting the sequence value
         }
     }
@@ -241,28 +296,28 @@ void handlePotentiometerChange(float nextValue)
 
 void handleButtonChange(long now)
 {
-    for (int i = 0; i < numButtons; ++i)
+    for (int i = 0; i < buttonCount; ++i)
     {
-        if (i == 4)
+        if (i == buttonCount - 1)
         {
-            if (now - button5LastPress > 500)
+            if (now - buttons[buttonCount - 1].lastPress > 500)
             {
-                buttonStates[4] = !buttonStates[4];
+                buttons[buttonCount - 1].state = !buttons[buttonCount - 1].state;
             }
             else
             {
-                buttonStates[4] = numSequences == 5 ? false : true;
-                numSequences = numSequences == 5 ? 4 : 5;
+                buttons[buttonCount - 1].state = numSequences == buttonCount ? false : true;
+                numSequences = numSequences == buttonCount ? buttonCount - 1 : buttonCount;
             }
 
-            button5LastPress = now;
+            buttons[buttonCount - 1].lastPress = now;
             break;
         }
         else
         {
-            if (buttonLastValues[i] == HIGH)
+            if (buttons[i].lastValue == HIGH)
             {
-                buttonStates[i] = !buttonStates[i];
+                buttons[i].state = !buttons[i].state;
                 break; // Exit loop after setting the sequence value
             }
         }
@@ -301,6 +356,7 @@ void handleBpmPotentiometerChange(float nextValue)
 
 void updateDisplay()
 {
+    // TODO: Update this to handle up to 9 beats
     long now = millis();
     int heldButtonIndex = getHeldButton(now);
 
@@ -314,25 +370,25 @@ void updateDisplay()
         {
             int sequenceIndex = i > 2 ? i - 1 : i;
 
-            NoteMap noteMap = getNoteFromVoltage(scale(sequences[sequenceIndex], voltageRange, cvRange));
+            NoteMap noteMap = getNoteFromVoltage(scale(buttons[sequenceIndex].cv, voltageRange, cvRange));
             char displayChar = sequenceIndex + 1 != currentBeat ? '_' : noteMap.note;
             bool isSharp = noteMap.isSharp;
 
-            if (currentBeat == sequenceIndex + 1 && buttonStates[sequenceIndex] == false)
+            if (currentBeat == sequenceIndex + 1 && buttons[sequenceIndex].state == false)
             {
                 displayChar = '-';
             }
 
             if (currentBeat == 5)
             {
-                NoteMap noteMap5 = getNoteFromVoltage(scale(sequences[4], voltageRange, cvRange));
+                NoteMap noteMap5 = getNoteFromVoltage(scale(buttons[4].cv, voltageRange, cvRange));
                 displayChar = noteMap5.note;
                 isSharp = noteMap5.isSharp;
             }
 
             if (heldButtonIndex > -1)
             {
-                NoteMap noteMapHeld = getNoteFromVoltage(scale(sequences[heldButtonIndex], voltageRange, cvRange));
+                NoteMap noteMapHeld = getNoteFromVoltage(scale(buttons[heldButtonIndex].cv, voltageRange, cvRange));
                 displayChar = noteMapHeld.note;
                 isSharp = noteMapHeld.isSharp;
             }
