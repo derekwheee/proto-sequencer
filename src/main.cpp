@@ -1,12 +1,11 @@
-// TODO: Smooth tuning pin potentiometer value?
-// TODO: Add comments where it would be helpful
+#include <Arduino.h>
 
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_LEDBackpack.h>
-
-#include "SAMDTimerInterrupt.h"
+#include <Adafruit_MCP23X17.h>
 #include <Adafruit_DotStar.h>
+#include "SAMDTimerInterrupt.h"
 #include "NoteTable.h"
 
 // Gate resolution should ideally be divisible by 4
@@ -24,23 +23,23 @@ SAMDTimer sequenceTimer(SELECTED_TIMER);
 #define LED_CLCK_PIN 6
 
 Adafruit_DotStar strip(NUM_LEDS, LED_DATA_PIN, LED_CLCK_PIN, DOTSTAR_BRG);
-
 Adafruit_7segment displayMatrix = Adafruit_7segment();
+Adafruit_MCP23X17 gpiox;
 
-#define DAC_OUTPUT_PIN A0
-#define POTENTIOMETER_PIN A5
-#define BPM_POTENTIOMETER_PIN A4
+#define DAC_OUTPUT_PIN A1
+#define POTENTIOMETER_PIN A4
+#define BPM_POTENTIOMETER_PIN A2
 #define GATE_POTENTIOMETER_PIN A3
-#define BUTTON_1_PIN 7
-#define BUTTON_2_PIN 9
-#define BUTTON_3_PIN 10
-#define BUTTON_4_PIN 11
-#define BUTTON_5_PIN 12
-#define BUTTON_6_PIN 12
-#define BUTTON_7_PIN 12
-#define BUTTON_8_PIN 12
-#define BUTTON_9_PIN 12
-#define GATE_PIN 2
+#define BUTTON_1_PIN 2
+#define BUTTON_2_PIN 1
+#define BUTTON_3_PIN 0
+#define BUTTON_4_PIN 5
+#define BUTTON_5_PIN 4
+#define BUTTON_6_PIN 3
+#define BUTTON_7_PIN 15
+#define BUTTON_8_PIN 7
+#define BUTTON_9_PIN 6
+#define GATE_PIN 14
 
 const int BUTTON_PINS[] = {
     BUTTON_1_PIN,
@@ -70,15 +69,15 @@ int buttonCount = sizeof(buttons) / sizeof(buttons[0]);
 
 void initializeButtons()
 {
-    for (int i = 0; i < sizeof(buttons) / sizeof(buttons[0]); i++)
+    for (unsigned int i = 0; i < sizeof(buttons) / sizeof(buttons[0]); i++)
     {
         buttons[i].pin = BUTTON_PINS[i];
         buttons[i].cv = i % 6;
         buttons[i].state = true;
         buttons[i].beginHighState = 0;
-        buttons[i].value = LOW;
-        buttons[i].lastValue = LOW;
-        pinMode(buttons[i].pin, INPUT_PULLUP);
+        buttons[i].value = HIGH;
+        buttons[i].lastValue = HIGH;
+        gpiox.pinMode(buttons[i].pin, INPUT_PULLUP);
     }
 }
 
@@ -86,6 +85,7 @@ struct DisplayChar
 {
     char note;
     bool isSharp;
+    NoteMap noteMap;
 };
 
 DisplayChar getChar(int index);
@@ -96,9 +96,9 @@ const int DAC_HIGH = 4095;
 
 const double dacRange[2] = {0, DAC_HIGH};
 const double voltageRange[2] = {0, ANALOG_HIGH};
-const double bpmRange[2] = {1, 4096};
-const double cvRange[2] = {0, 5};
-const double gateRange[2] = {0, 12};
+const double bpmRange[2] = {600, 20};
+const double cvRange[2] = {5, 0};
+const double gateRange[2] = {12, 0};
 
 uint32_t potentiometerValue;
 uint32_t lastPotentiometerValue;
@@ -113,7 +113,7 @@ int numSequences = buttonCount;
 bool showingPixel = false;
 
 unsigned long lastUpdateTime = 0;
-const unsigned long updateInterval = 100;
+const unsigned long updateInterval = 10;
 
 int gateState = LOW;
 
@@ -123,10 +123,36 @@ int smoothedGateValue = 0;
 
 int sequenceCounter = -1; // Initial state
 
+float scale(float value, const double inputRange[2], const double outputRange[2]);
+float scale(float value, const double inputRange[2], const double outputRange[2], int precision);
+float clamp(float value, const double range[2]);
+void incrementSequence();
+void playSequence();
+int getHeldButton(long now);
+bool wasAnyButtonPressed(long now);
+void updateButtonState(long now);
+void handlePotentiometerChange(float nextValue);
+void handleButtonChange(long now);
+void handleBpmPotentiometerChange(float nextValue);
+DisplayChar getChar(int index);
+void updateDisplay();
+void updateGPIO();
+
 void setup()
 {
+    Serial.begin(115200);
+    while (!Serial)
+        ;
+
+    if (!gpiox.begin_I2C())
+    {
+        Serial.println("Could not connect to GPIO expander");
+        while (1)
+            ;
+    }
+
     initializeButtons();
-    pinMode(GATE_PIN, OUTPUT);
+    gpiox.pinMode(GATE_PIN, OUTPUT);
 
     bpm = scale(120, bpmRange, voltageRange);
     fillNoteMap();
@@ -138,13 +164,14 @@ void setup()
     strip.show();
 
     displayMatrix.begin(0x70);
-
-    Serial.begin(115200);
 }
 
 void loop()
 {
     unsigned long now = millis();
+
+    updateGPIO();
+    updateDisplay();
 
     if (now - lastUpdateTime >= updateInterval)
     {
@@ -177,9 +204,17 @@ void loop()
             handleButtonChange(now);
         }
 
-        Serial.println(bpm);
+        Serial.println(now);
         Serial.println(scale(bpm, voltageRange, bpmRange));
-        Serial.println(1000 / (scale(bpm, voltageRange, bpmRange) / 60) / GATE_RESOLUTION);
+        Serial.println(gpiox.digitalRead(0));
+        Serial.println(gpiox.digitalRead(1));
+        Serial.println(gpiox.digitalRead(2));
+        Serial.println(gpiox.digitalRead(3));
+        Serial.println(gpiox.digitalRead(4));
+        Serial.println(gpiox.digitalRead(5));
+        Serial.println(gpiox.digitalRead(6));
+        Serial.println(gpiox.digitalRead(7));
+        Serial.println(gpiox.digitalRead(15));
     }
 }
 
@@ -200,11 +235,14 @@ float clamp(float value, const double range[2])
                                                           : value;
 }
 
-bool shouldSkipSequence = false;
-
 void incrementSequence()
 {
     sequenceCounter = sequenceCounter >= GATE_RESOLUTION - 1 ? 0 : 1 + sequenceCounter;
+}
+
+void updateGPIO()
+{
+    gpiox.digitalWrite(GATE_PIN, gateState);
 }
 
 void playSequence()
@@ -213,7 +251,7 @@ void playSequence()
 
     if (sequenceCounter >= GATE_RESOLUTION - abs(GATE_RESOLUTION - smoothedGateValue))
     {
-        digitalWrite(GATE_PIN, LOW);
+        gateState = LOW;
     }
 
     if (sequenceCounter % GATE_RESOLUTION != 0)
@@ -229,9 +267,7 @@ void playSequence()
     int beatIndex = heldButton > -1 ? heldButton : currentBeat - 1;
 
     analogWrite(DAC_OUTPUT_PIN, scale(buttons[beatIndex].cv, voltageRange, dacRange));
-    digitalWrite(GATE_PIN, HIGH);
-
-    updateDisplay();
+    gateState = HIGH;
 
     strip.setPixelColor(0, strip.Color(0, 0, !showingPixel ? 64 : 0));
     strip.show();
@@ -252,7 +288,7 @@ int getHeldButton(long now)
 
     for (int i = 0; i < buttonCount; ++i)
     {
-        if (buttons[i].value == HIGH && now - buttons[i].beginHighState > 500)
+        if (buttons[i].value == LOW && now - buttons[i].beginHighState > 500)
         {
             _heldButtonIndex = i;
             break;
@@ -268,7 +304,7 @@ bool wasAnyButtonPressed(long now)
 
     for (int i = 0; i < buttonCount; ++i)
     {
-        if (buttons[i].value == LOW && buttons[i].lastValue == HIGH && now - buttons[i].beginHighState < 500)
+        if (buttons[i].value == HIGH && buttons[i].lastValue == LOW && now - buttons[i].beginHighState < 500)
         {
             _wasAnyButtonPressed = true;
             break;
@@ -283,9 +319,9 @@ void updateButtonState(long now)
     for (int i = 0; i < buttonCount; ++i)
     {
         buttons[i].lastValue = buttons[i].value;
-        buttons[i].value = digitalRead(BUTTON_PINS[i]);
+        buttons[i].value = gpiox.digitalRead(buttons[i].pin);
 
-        if (buttons[i].value == HIGH && buttons[i].lastValue == LOW)
+        if (buttons[i].value == LOW && buttons[i].lastValue == HIGH)
             buttons[i].beginHighState = now;
     }
 }
@@ -294,7 +330,7 @@ void handlePotentiometerChange(float nextValue)
 {
     for (int i = 0; i < buttonCount; ++i)
     {
-        if (digitalRead(buttons[i].pin) == HIGH)
+        if (gpiox.digitalRead(buttons[i].pin) == LOW)
         {
             buttons[i].cv = nextValue;
             break; // Exit loop after setting the sequence value
@@ -331,7 +367,7 @@ void handleButtonChange(long now)
         else
         {
             // If the button has changed from HIGH to LOW toggle state
-            if (buttons[i].lastValue == HIGH)
+            if (buttons[i].lastValue == LOW)
             {
                 buttons[i].state = !buttons[i].state;
                 buttons[i].lastPress = now;
@@ -366,7 +402,7 @@ void handleBpmPotentiometerChange(float nextValue)
     }
 
     sequenceTimer.detachInterrupt();
-    sequenceTimer.attachInterruptInterval_MS(60 * 1000 / scale(bpm, voltageRange, bpmRange) / 4, playSequence);
+    sequenceTimer.attachInterruptInterval_MS(1000 / (scale(bpm, voltageRange, bpmRange) / 60) / GATE_RESOLUTION, playSequence);
 
     lastBpmChange = now;
 }
@@ -381,7 +417,8 @@ DisplayChar getChar(int index)
     DisplayChar displayChar = {
         note : index + 1 != currentBeat ? '_' : buttons[index].state ? noteMap.note
                                                                      : '-',
-        isSharp : noteMap.isSharp
+        isSharp : noteMap.isSharp,
+        noteMap : noteMap
     };
 
     return displayChar;
@@ -392,30 +429,36 @@ void updateDisplay()
     long now = millis();
     int heldButtonIndex = getHeldButton(now);
 
-    int offset = currentBeat > 3 ? 4 : 0;
+    int offset = currentBeat > 4 ? 4 : 0;
 
     DisplayChar char1;
     DisplayChar char2;
     DisplayChar char3;
     DisplayChar char4;
 
-    // If a button is being held down show that note
-    // on all positions
-    if (heldButtonIndex > -1)
-    {
-        char1 = getChar(heldButtonIndex);
-        char2 = getChar(heldButtonIndex);
-        char3 = getChar(heldButtonIndex);
-        char4 = getChar(heldButtonIndex);
-    }
     // If the current beat is the last button, i.e.
     // 5 or 9 show that note on all positions
-    else if (currentBeat == buttonCount)
+    if (currentBeat == buttonCount)
     {
         char1 = getChar(currentBeat - 1);
         char2 = getChar(currentBeat - 1);
         char3 = getChar(currentBeat - 1);
         char4 = getChar(currentBeat - 1);
+    }
+    // If a button is being held down show that note
+    // on all positions
+    else if (heldButtonIndex > -1)
+    {
+        DisplayChar rootChar = getChar(heldButtonIndex);
+        DisplayChar fillChar = {
+            note : rootChar.noteMap.note,
+            isSharp : rootChar.isSharp
+        };
+
+        char1 = fillChar;
+        char2 = fillChar;
+        char3 = fillChar;
+        char4 = fillChar;
     }
     // Otherwise just show each note for the
     // current page of beats
