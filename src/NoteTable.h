@@ -32,7 +32,7 @@ void fillNoteMap()
         VoltToNoteMap[i * 12 + 2] = {0.16 + i, 'D', false, i};
         VoltToNoteMap[i * 12 + 3] = {0.25 + i, 'D', true, i};
         VoltToNoteMap[i * 12 + 4] = {0.33 + i, 'E', false, i};
-        VoltToNoteMap[i * 12 + 5] = {0.41 + i, 'F', true, i};
+        VoltToNoteMap[i * 12 + 5] = {0.41 + i, 'F', false, i};
         VoltToNoteMap[i * 12 + 6] = {0.50 + i, 'F', true, i};
         VoltToNoteMap[i * 12 + 7] = {0.58 + i, 'G', false, i};
         VoltToNoteMap[i * 12 + 8] = {0.66 + i, 'G', true, i};
