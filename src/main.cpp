@@ -9,7 +9,7 @@
 #include "NoteTable.h"
 
 // Gate resolution should ideally be divisible by 4
-#define GATE_RESOLUTION 12
+#define GATE_RESOLUTION 16
 
 // Timer config
 #define USING_TIMER_TC3 true
@@ -39,7 +39,24 @@ Adafruit_MCP23X17 gpiox;
 #define BUTTON_7_PIN 15
 #define BUTTON_8_PIN 7
 #define BUTTON_9_PIN 6
-#define GATE_PIN 14
+#define GATE_PIN 13
+#define SYNC_PIN 14
+
+// Constants
+const int ANALOG_HIGH = 1023;
+const int DAC_HIGH = 4095;
+
+const double dacRange[2] = {0, DAC_HIGH};
+const double voltageRange[2] = {0, ANALOG_HIGH};
+const double inverseVoltageRange[2] = {ANALOG_HIGH, 0};
+const double cvRange[2] = {0, 5};
+// These potentiometers are wired backwards, so the ranges are inverted
+const double bpmRange[2] = {600, 50};
+const double gateRange[2] = {GATE_RESOLUTION, 0};
+
+float scale(float value, const double inputRange[2], const double outputRange[2]);
+float scale(float value, const double inputRange[2], const double outputRange[2], int precision);
+float clamp(float value, const double range[2]);
 
 const int BUTTON_PINS[] = {
     BUTTON_1_PIN,
@@ -57,7 +74,7 @@ struct Button
     int pin;
     uint32_t cv;
     bool state;
-    long beginHighState;
+    long beginPressedState;
     int value;
     int lastValue;
     long lastPress;
@@ -69,12 +86,13 @@ int buttonCount = sizeof(buttons) / sizeof(buttons[0]);
 
 void initializeButtons()
 {
+    double cvRange[2] = {0.0, 5.0};
     for (unsigned int i = 0; i < sizeof(buttons) / sizeof(buttons[0]); i++)
     {
         buttons[i].pin = BUTTON_PINS[i];
-        buttons[i].cv = i % 6;
+        buttons[i].cv = scale((i % 6), cvRange, voltageRange);
         buttons[i].state = true;
-        buttons[i].beginHighState = 0;
+        buttons[i].beginPressedState = 0;
         buttons[i].value = HIGH;
         buttons[i].lastValue = HIGH;
         gpiox.pinMode(buttons[i].pin, INPUT_PULLUP);
@@ -89,16 +107,6 @@ struct DisplayChar
 };
 
 DisplayChar getChar(int index);
-
-// Constants
-const int ANALOG_HIGH = 1023;
-const int DAC_HIGH = 4095;
-
-const double dacRange[2] = {0, DAC_HIGH};
-const double voltageRange[2] = {0, ANALOG_HIGH};
-const double bpmRange[2] = {600, 20};
-const double cvRange[2] = {5, 0};
-const double gateRange[2] = {12, 0};
 
 uint32_t potentiometerValue;
 uint32_t lastPotentiometerValue;
@@ -123,13 +131,10 @@ int smoothedGateValue = 0;
 
 int sequenceCounter = -1; // Initial state
 
-float scale(float value, const double inputRange[2], const double outputRange[2]);
-float scale(float value, const double inputRange[2], const double outputRange[2], int precision);
-float clamp(float value, const double range[2]);
 void incrementSequence();
 void playSequence();
 int getHeldButton(long now);
-bool wasAnyButtonPressed(long now);
+int wasAnyButtonPressed(long now);
 void updateButtonState(long now);
 void handlePotentiometerChange(float nextValue);
 void handleButtonChange(long now);
@@ -141,8 +146,6 @@ void updateGPIO();
 void setup()
 {
     Serial.begin(115200);
-    while (!Serial)
-        ;
 
     if (!gpiox.begin_I2C())
     {
@@ -173,48 +176,51 @@ void loop()
     updateGPIO();
     updateDisplay();
 
-    if (now - lastUpdateTime >= updateInterval)
+    // Record the last update time
+    lastUpdateTime = now;
+
+    updateButtonState(now);
+    lastPotentiometerValue = potentiometerValue;
+    lastBpmPotentiometerValue = potentiometerValue;
+
+    // Tuning potentiometer is wired backwards, use inverse range
+    potentiometerValue = scale(analogRead(POTENTIOMETER_PIN), voltageRange, inverseVoltageRange);
+    bpmPotentiometerValue = clamp(analogRead(BPM_POTENTIOMETER_PIN), voltageRange);
+    gatePotentiometerValue = (int)scale(analogRead(GATE_POTENTIOMETER_PIN), voltageRange, gateRange, 1);
+
+    smoothedBpmValue = (smoothingFactor * bpmPotentiometerValue) + ((1 - smoothingFactor) * smoothedBpmValue);
+    smoothedGateValue = (smoothingFactor * gatePotentiometerValue) + ((1 - smoothingFactor) * smoothedGateValue);
+
+    if (lastBpmPotentiometerValue != smoothedBpmValue)
     {
-        // Record the last update time
-        lastUpdateTime = now;
+        handleBpmPotentiometerChange(smoothedBpmValue);
+    }
 
-        updateButtonState(now);
-        lastPotentiometerValue = potentiometerValue;
-        lastBpmPotentiometerValue = potentiometerValue;
+    if (getHeldButton(now) > -1)
+    {
+        handlePotentiometerChange(potentiometerValue);
+    }
+    else if (wasAnyButtonPressed(now) > -1)
+    {
+        handleButtonChange(now);
+    }
 
-        potentiometerValue = clamp(analogRead(POTENTIOMETER_PIN), voltageRange);
-        bpmPotentiometerValue = clamp(analogRead(BPM_POTENTIOMETER_PIN), voltageRange);
-        gatePotentiometerValue = (int)scale(analogRead(GATE_POTENTIOMETER_PIN), voltageRange, gateRange, 1);
-
-        smoothedBpmValue = (smoothingFactor * bpmPotentiometerValue) + ((1 - smoothingFactor) * smoothedBpmValue);
-        smoothedGateValue = (smoothingFactor * gatePotentiometerValue) + ((1 - smoothingFactor) * smoothedGateValue);
-
-        if (lastBpmPotentiometerValue != smoothedBpmValue)
-        {
-            handleBpmPotentiometerChange(smoothedBpmValue);
-        }
-
-        if (getHeldButton(now) > -1)
-        {
-            handlePotentiometerChange(potentiometerValue);
-        }
-
-        if (wasAnyButtonPressed(now))
-        {
-            handleButtonChange(now);
-        }
-
+    if (Serial)
+    {
         Serial.println(now);
         Serial.println(scale(bpm, voltageRange, bpmRange));
-        Serial.println(gpiox.digitalRead(0));
-        Serial.println(gpiox.digitalRead(1));
-        Serial.println(gpiox.digitalRead(2));
-        Serial.println(gpiox.digitalRead(3));
-        Serial.println(gpiox.digitalRead(4));
-        Serial.println(gpiox.digitalRead(5));
-        Serial.println(gpiox.digitalRead(6));
-        Serial.println(gpiox.digitalRead(7));
-        Serial.println(gpiox.digitalRead(15));
+        Serial.println(buttons[currentBeat - 1].cv);
+        Serial.println(scale(buttons[currentBeat - 1].cv, voltageRange, dacRange));
+        Serial.println(potentiometerValue);
+        Serial.println(buttons[0].value);
+        Serial.println(buttons[1].value);
+        Serial.println(buttons[2].value);
+        Serial.println(buttons[3].value);
+        Serial.println(buttons[4].value);
+        Serial.println(buttons[5].value);
+        Serial.println(buttons[6].value);
+        Serial.println(buttons[7].value);
+        Serial.println(buttons[8].value);
     }
 }
 
@@ -266,8 +272,13 @@ void playSequence()
     int heldButton = getHeldButton(now);
     int beatIndex = heldButton > -1 ? heldButton : currentBeat - 1;
 
-    analogWrite(DAC_OUTPUT_PIN, scale(buttons[beatIndex].cv, voltageRange, dacRange));
-    gateState = HIGH;
+    if (buttons[beatIndex].state)
+    {
+        analogWrite(DAC_OUTPUT_PIN, scale(buttons[beatIndex].cv, voltageRange, dacRange));
+        gateState = HIGH;
+    } else {
+        gateState = LOW;
+    }
 
     strip.setPixelColor(0, strip.Color(0, 0, !showingPixel ? 64 : 0));
     strip.show();
@@ -288,7 +299,7 @@ int getHeldButton(long now)
 
     for (int i = 0; i < buttonCount; ++i)
     {
-        if (buttons[i].value == LOW && now - buttons[i].beginHighState > 500)
+        if (buttons[i].value == LOW && now - buttons[i].beginPressedState > 500)
         {
             _heldButtonIndex = i;
             break;
@@ -298,20 +309,25 @@ int getHeldButton(long now)
     return _heldButtonIndex;
 }
 
-bool wasAnyButtonPressed(long now)
+bool wasButtonPressed(Button button, long now)
 {
-    bool _wasAnyButtonPressed = false;
+    return button.value == HIGH && button.lastValue == LOW && now - button.beginPressedState < 500;
+}
+
+int wasAnyButtonPressed(long now)
+{
+    int pressedButtonIndex = -1;
 
     for (int i = 0; i < buttonCount; ++i)
     {
-        if (buttons[i].value == HIGH && buttons[i].lastValue == LOW && now - buttons[i].beginHighState < 500)
+        if (wasButtonPressed(buttons[i], now))
         {
-            _wasAnyButtonPressed = true;
+            pressedButtonIndex = i;
             break;
         }
     }
 
-    return _wasAnyButtonPressed;
+    return pressedButtonIndex;
 }
 
 void updateButtonState(long now)
@@ -322,7 +338,7 @@ void updateButtonState(long now)
         buttons[i].value = gpiox.digitalRead(buttons[i].pin);
 
         if (buttons[i].value == LOW && buttons[i].lastValue == HIGH)
-            buttons[i].beginHighState = now;
+            buttons[i].beginPressedState = now;
     }
 }
 
@@ -330,7 +346,7 @@ void handlePotentiometerChange(float nextValue)
 {
     for (int i = 0; i < buttonCount; ++i)
     {
-        if (gpiox.digitalRead(buttons[i].pin) == LOW)
+        if (buttons[i].value == LOW)
         {
             buttons[i].cv = nextValue;
             break; // Exit loop after setting the sequence value
@@ -367,7 +383,7 @@ void handleButtonChange(long now)
         else
         {
             // If the button has changed from HIGH to LOW toggle state
-            if (buttons[i].lastValue == LOW)
+            if (wasButtonPressed(buttons[i], now))
             {
                 buttons[i].state = !buttons[i].state;
                 buttons[i].lastPress = now;
@@ -384,7 +400,7 @@ void handleBpmPotentiometerChange(float nextValue)
 {
     long now = millis();
 
-    if (now - lastBpmChange < 300)
+    if (now - lastBpmChange < 100)
     {
         return;
     }
@@ -393,7 +409,7 @@ void handleBpmPotentiometerChange(float nextValue)
     movingBpm[1] = movingBpm[2];
     movingBpm[2] = nextValue;
 
-    int threshold = 10;
+    int threshold = 2;
     float movingAverage = (movingBpm[0] + movingBpm[1] + movingBpm[2]) / 3;
 
     if (nextValue > (movingAverage + threshold) || nextValue < (movingAverage - threshold))
@@ -436,18 +452,9 @@ void updateDisplay()
     DisplayChar char3;
     DisplayChar char4;
 
-    // If the current beat is the last button, i.e.
-    // 5 or 9 show that note on all positions
-    if (currentBeat == buttonCount)
-    {
-        char1 = getChar(currentBeat - 1);
-        char2 = getChar(currentBeat - 1);
-        char3 = getChar(currentBeat - 1);
-        char4 = getChar(currentBeat - 1);
-    }
     // If a button is being held down show that note
     // on all positions
-    else if (heldButtonIndex > -1)
+    if (heldButtonIndex > -1)
     {
         DisplayChar rootChar = getChar(heldButtonIndex);
         DisplayChar fillChar = {
@@ -459,6 +466,15 @@ void updateDisplay()
         char2 = fillChar;
         char3 = fillChar;
         char4 = fillChar;
+    }
+    // If the current beat is the last button, i.e.
+    // 5 or 9 show that note on all positions
+    else if (currentBeat == buttonCount)
+    {
+        char1 = getChar(currentBeat - 1);
+        char2 = getChar(currentBeat - 1);
+        char3 = getChar(currentBeat - 1);
+        char4 = getChar(currentBeat - 1);
     }
     // Otherwise just show each note for the
     // current page of beats
